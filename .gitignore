@@ -1,0 +1,8 @@
+/input
+/output
+/rna_velocity
+renv/
+.DS_Store
+.dvc/cache/
+.dvc/tmp/
+.dvc/config.local

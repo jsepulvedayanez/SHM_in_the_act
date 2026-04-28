@@ -1,0 +1,6 @@
+outs:
+- md5: 74159a7703115f95042e0fb78b333583.dir
+  size: 12296
+  nfiles: 2
+  hash: md5
+  path: rna_velocity
