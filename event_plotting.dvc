@@ -1,0 +1,6 @@
+outs:
+- md5: aa5fd54d52ac44db68087ca9402f65a7.dir
+  size: 1096617144
+  nfiles: 2614
+  hash: md5
+  path: event_plotting

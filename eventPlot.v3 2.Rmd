@@ -1,0 +1,674 @@
+---
+title: "Advanced plotting SHM-CITA events"
+author:
+  name: C.A.M. van Bergen
+  affiliation: Leiden University Medical Center
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  html_document:
+    keep_md : true
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#### libraries and functions
+
+```{r message=FALSE, warning=FALSE}
+# load packages and user-defined functions
+#source("~/repositories/FL_10X_2/000_Documents/kees_functions.R")
+library(R.utils)
+library(tidyverse)
+library(DescTools)
+library(parallel)
+library(data.table)
+
+# function to plot a single umigroup
+# p = plotData
+# u = the umiGroup to plot
+# ymin ymax coordinates on y axis
+PlotUmiGroup <- function(p, u) {
+  p <- p %>%
+    filter(
+      umiGroup == u,
+      SHM != "x"
+    )
+  geom_rect(
+    data = p,
+    aes(xmin = pos - 0.4, xmax = pos + 0.4, ymin = start, ymax = end, fill = SHM), alpha = 0.3
+  )
+}
+
+plot_aid_motif <- function(aid_motifs, selected_motif, position) {
+  motif_nucl <- aid_motifs %>%
+    filter(motif == selected_motif) %>%
+    pull(nucl) %>%
+    unique()
+  motif_nucl_rc <- aid_motifs %>%
+    filter(motif == paste0(selected_motif, "-RC")) %>%
+    pull(nucl) %>%
+    unique()
+
+  list(
+    # draw the motif
+    geom_rect(
+      data = aid_motifs %>% filter(grepl(selected_motif, motif)),
+      aes(
+        xmin = start - 0.4,
+        xmax = end + 0.4,
+        ymin = position - 0.07,
+        ymax = position
+      ),
+      fill = color_aid_motif,
+      alpha = 0.9
+    ),
+    # draw mutation nucleotide
+    geom_rect(
+      data = aid_motifs %>% filter(motif == selected_motif),
+      aes(
+        xmin = start - 0.4 + nucl_pos,
+        xmax = start + 0.4 + nucl_pos,
+        ymin = position - 0.07,
+        ymax = position
+      ),
+      fill = palette_nucleotides[motif_nucl],
+      alpha = 0.7
+    ),
+    geom_rect(
+      data = aid_motifs %>% filter(motif == paste0(selected_motif, "-RC")),
+      aes(
+        xmin = start - 0.4 + nucl_pos,
+        xmax = start + 0.4 + nucl_pos,
+        ymin = position - 0.07,
+        ymax = position
+      ),
+      fill = palette_nucleotides[motif_nucl_rc],
+      alpha = 0.85
+    )
+  )
+}
+
+mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+```
+
+#### constants
+
+```{r}
+mc_cores <- 8
+
+aid_motif_regex <- list(
+  "WRCY"    = "[AT][AG]C[CT]",
+  "WRCY-RC" = "[AG]G[CT][AT]",
+  "RCG"     = "[AG]CG",
+  "RCG-RC"  = "CG[CT]",
+  "WA"      = "[AT]A",
+  "WA-RC"   = "T[AT]"
+)
+
+## COLORS
+color_cdr <- "#FCA17D"
+color_aid_motif <- "#d7bcff"
+color_aid_motif_2 <- "#a3d5cc"
+
+palette_nucleotides <- c(
+  A = "#00a853", C = "#008bcb", G = "#fde064", T = "#ee273f"
+)
+```
+
+
+
+##### extract data from JS output files of cells with events
+
+```{r message=FALSE, warning=FALSE}
+# read clone table
+clones <-
+  bind_rows(
+    read_csv("~/repositories/FL_10X_2/250_Clonotypes/outs/clonesMulti_2022_06_09.csv"),
+    read_csv("~/repositories/FL_10X_2/250_Clonotypes/outs/clones_2022_01_18.csv"),
+    read_rds("~/repositories/FL_10X_2/250_Clonotypes.freeze02/outs/clonesB_20210823.rds")
+  ) %>%
+  # add ig
+  mutate(
+    cell = substr(barcode, 1, 16),
+    ig = case_when(
+      v_gene %like% "IGH" ~ "HC",
+      v_gene %like% "IGK" ~ "LC",
+      v_gene %like% "IGL" ~ "LC"
+    )
+  ) %>%
+  distinct(source, subject, barcode, chain, .keep_all = TRUE)
+
+
+# dir of files JS
+files <-
+  list.files("~/repositories/FL_10X_2/310_Caught_in_the_act_AID/outs/fasta_SHM_cells/", pattern = "K.*\\.fasta", full.names = TRUE)
+
+events <-
+  rbindlist(
+    mclapply(files,
+      function(f) {
+        print(f)
+        # load fasta: names and sequences
+        df <- read.fasta(f, as.string = T) %>%
+          unlist() %>%
+          data.frame(name = names(.), seq = .) %>%
+          # extract variables from name and bind
+          separate(
+            name,
+            into = c("source", "subject", "ig", "cell", "umi", "pos_cons", "pos", "mut1"),
+            sep = "[-_]",
+            remove = FALSE
+          ) %>%
+          mutate(pos = as.integer(pos))
+
+        # get the event positions (may be >1)
+        events <-
+          df %>%
+          distinct(pos) %>%
+          # remove NA in position
+          filter(!is.na(pos))
+
+        if (nrow(events) >= 1) {
+          # inspect all positions
+          d <-
+            rbindlist(
+              lapply(
+                1:nrow(events),
+                function(e) {
+                  # event rows
+                  d <- df %>%
+                    filter(pos == events$pos[e]) %>%
+                    mutate(
+                      eventUmis_A = nrow(filter(., mut1 == "A")),
+                      eventUmis_C = nrow(filter(., mut1 == "C")),
+                      eventUmis_G = nrow(filter(., mut1 == "G")),
+                      eventUmis_T = nrow(filter(., mut1 == "T")),
+                    )
+
+                  # extract cell CR-IMGT data from clones
+                  imgt_cell <-
+                    clones %>%
+                    filter(
+                      source == unique(d$source),
+                      subject == unique(d$subject),
+                      cell %like% unique(d$cell)
+                    ) %>%
+                    filter(ig == unique(d$ig))
+
+                  # from the old files, sometimes 2 rows are remaining
+                  if (nrow(imgt_cell) > 1) {
+                    imgt_cell <-
+                      imgt_cell %>%
+                      filter(domVgeneIMGT == TRUE)
+                  }
+
+                  # cells may be missing from current version of clones
+                  if (nrow(imgt_cell) > 0) {
+                    # detect start of V(D)J in umi sequences
+                    d[, c("alignStart", "alignWidth")] <- t(sapply(
+                      1:nrow(d),
+                      function(r) {
+                        # align to get start of V(D) in the umi seq
+                        aln <- pairwiseAlignmentPreset(
+                          toupper(as.character(d[r, "seq"])),
+                          toupper(imgt_cell$seq),
+                          score = FALSE
+                        )
+                        return(c(aln@pattern@range@start, aln@pattern@range@width))
+                      }
+                    ))
+
+                    d <- d %>%
+                      mutate(
+                        # cut V(D)J
+                        seqVDJ     = toupper(substr(seq, alignStart, alignStart + alignWidth)),
+                        # cut mutation
+                        mut2       = toupper(substr(seqVDJ, pos, pos)),
+                        # is mut1 == mut2: detected letters are indeed the JS reported variant
+                        mutMatch   = unique(mut1 == mut2),
+                        # the nt at pos in CR
+                        cellRanger = substr(imgt_cell$seq, pos, pos),
+                      ) %>%
+                      relocate(mut2, .after = mut1) %>%
+                      relocate(mutMatch, .after = eventUmis_T)
+
+                    # the PO sequence
+                    d[, "PO"] <-
+                      clones %>%
+                      filter(
+                        source == unique(d$source),
+                        subject == unique(d$subject),
+                        barcode == "PO"
+                      ) %>%
+                      # add ig
+                      mutate(ig = case_when(
+                        chain == "IGH" ~ "HC",
+                        chain %in% c("IGK", "IGL") ~ "LC"
+                      )) %>%
+                      filter(ig == unique(d$ig)) %>%
+                      pull(seq) %>%
+                      # substr( start = unique( d$pos ), stop = unique( d$pos ) ) %>%
+                      toupper()
+                  }
+                  return(d)
+                }
+              )
+            )
+        }
+      },
+      mc.cores = mc_cores
+    ),
+    fill = TRUE
+  ) %>%
+  # create event id and cell id
+  mutate(
+    id = paste(source, cell, pos, sep = "_"),
+    sourceCellIg = paste0(source, "_", cell, "_", ig)
+  ) %>%
+  relocate(id, .before = name) %>%
+  relocate(sourceCellIg, .after = id)
+
+# # join with cellranger seq
+out <- events %>%
+  left_join(
+    clones %>%
+      mutate(cell = substr(barcode, 1, 16)) %>%
+      dplyr::rename(seqCR = seq) %>%
+      select(source, subject, cell, chain, seqCR, ig) %>%
+      distinct(source, subject, cell, seqCR, ig),
+    by = c("source", "subject", "cell", "ig")
+  ) %>%
+  # for some cells I have no data in clones from cellRanger data
+  # various reasons, checked 3 with Julieta, all make sense
+  filter(!is.na(seqVDJ))
+
+# write as fasta for IMGT vQuest to obtain FR-CDR positions, can be done on cellRanger vdj
+seqinr::write.fasta(
+  sequences = as.list(out %>%
+    distinct(id, .keep_all = TRUE) %>%
+    # slice_head( n = 50 ) %>%
+    pull(seqVDJ)),
+  names = as.list(out %>%
+    distinct(id, .keep_all = TRUE) %>%
+    # slice_head( n = 50 ) %>%
+    pull(id)),
+  as.string = TRUE,
+  file.out = paste0("../310_Caught_in_the_act_AID/outs/forIMGT.fasta")
+)
+
+# read manually saved IMGT output
+IMGTout <-
+  read_delim("../310_Caught_in_the_act_AID/outs/IMGT_Vquest_for_CDR_FR/highV_quest/3_Nt-sequences.txt",
+    "\t",
+    escape_double = FALSE, trim_ws = TRUE, show_col_types = FALSE
+  ) %>%
+  select(
+    -`N-REGION`,
+    c(
+      `Sequence ID`, `FR1-IMGT start`, `FR1-IMGT end`, `CDR1-IMGT start`, `CDR1-IMGT end`, `FR2-IMGT start`,
+      `FR2-IMGT end`, `CDR2-IMGT start`, `CDR2-IMGT end`, `FR3-IMGT start`,
+      `FR3-IMGT end`, `CDR3-IMGT start`, `CDR3-IMGT end`, `FR4-IMGT start`, `FR4-IMGT end`
+    )
+  ) %>%
+  dplyr::rename(id = `Sequence ID`)
+
+# join in
+out <-
+  left_join(out,
+    IMGTout,
+    by = "id"
+  ) %>%
+  # remove rows without IMGT data
+  filter(!is.na(`FR1-IMGT start`))
+
+# number of cells with events
+print(paste(
+  "number of cells with event(s) = ",
+  events %>%
+    distinct(source, subject, cell) %>%
+    nrow()
+))
+
+# number of events
+print(paste0(
+  "number of events = ",
+  events %>%
+    distinct(source, subject, cell, ig, pos) %>%
+    nrow()
+))
+```
+
+##### plotting
+
+```{r, message=FALSE, warning=FALSE, fig.width=22, fig.height=3.5}
+# create output dir
+mkdirs("outs/shm_events_img")
+
+# height was 5
+# visualization of SHM CITA
+cell_ids <- out %>%
+  pull(sourceCellIg) %>%
+  unique()
+
+lapply(cell_ids, function(id) {
+  print(id)
+  # extract event
+  s <- substr(id, 1, 3)
+  c <- substr(id, 5, 20)
+  g <- substr(id, 22, 23)
+
+  # filter rows
+  d <- out %>%
+    filter(
+      source == s,
+      cell == c,
+      ig == g
+    ) %>%
+    mutate(
+      POnt = substr(PO, pos, pos),
+      seqCR = toupper(seqCR)
+    ) %>%
+    relocate(POnt, .after = pos)
+
+  eventPos <-
+    d$pos %>%
+    unique() %>%
+    sort()
+
+  # some 3' nt may be N
+  # trim everything to the shortest sequence
+  nPositions <- na.exclude(str_locate(d$seqVDJ, "N+$")[, "start"] - 1)
+  if (length(nPositions) > 0 || length(unique(nchar(d$seqVDJ))) > 1) {
+    cut <- min(nPositions, unique(nchar(d$seqVDJ)))
+    d <- d %>%
+      mutate_at(
+        c("seqVDJ", "PO", "seqCR"),
+        ~ substr(., 1, cut)
+      )
+  }
+
+
+  # in PO:
+  # locate canonical AID motif wrCy, wrCy, rCg, cGy
+  aid_motifs <- bind_rows(lapply(
+    names(aid_motif_regex),
+    function(m) {
+      locs <- str_locate_all(
+        toupper(unique(d$PO)),
+        pattern = aid_motif_regex[[m]]
+      )
+      if (length(locs) > 0) {
+        return(
+          locs %>%
+            as.data.frame() %>%
+            mutate(motif = m)
+        )
+      } else {
+        return(data.frame(start = c(), end = c(), motif = c()))
+      }
+    }
+  )) %>%
+    mutate(
+      nucl = case_when(
+        motif %in% c("WRCY", "RCG") ~ "C",
+        motif %in% c("WRCY-RC", "RCG-RC") ~ "G",
+        motif == "WA" ~ "A",
+        motif == "WA-RC" ~ "T"
+      ),
+      nucl_pos = case_when(
+        motif == "WRCY" ~ 2,
+        motif == "WA-RC" ~ 0,
+        .default = 1
+      )
+    ) %>%
+    arrange(start)
+
+  # these are the letters at the event position
+  # PO: is the starting letter
+  ev0 <- substr(unique(d$PO), unique(d$pos), unique(d$pos))
+  # CR: from cellranger letter
+  cr <- unique(d$cellRanger)
+  # event letter( s )
+  ev <- unique(d$mut1)
+  # event is arising from PO?
+  if (ev0 %in% ev) {
+    # ev0 remains PO
+    # ev1 is the other letter
+    ev1 <- ev[which(ev != ev0)]
+  } else {
+    # is event not arising from PO?
+    # just pick first and second
+    ev0 <- ev[1]
+    ev1 <- ev[2]
+  }
+
+  # group sequences by identical sequence of VDJ
+  d <- d %>%
+    group_by(seqVDJ) %>%
+    mutate(umiGroupCount = n()) %>%
+    slice_head(n = 1) %>%
+    ungroup() %>%
+    # rank umis from ev0 to ev1
+    mutate(is_ev0 = mut1 == ev0) %>%
+    arrange(is_ev0, desc(umiGroupCount)) %>%
+    rownames_to_column("umiGroup") %>%
+    select(
+      subject, ig, mut1, umiGroup, umiGroupCount, PO, seqCR, seqVDJ,
+      contains("IMGT")
+    ) %>%
+    # umiGroup fraction
+    # calculate start and end of umi group on a scale 0 - 1
+    mutate(
+      size  = umiGroupCount / sum(umiGroupCount),
+      end   = cumsum(size),
+      start = end - size
+    )
+
+  # the sequence of PO and seqCR split into a table
+  nchars <- nchar(unique(d$PO))
+  plotData <- data.frame(
+    pos         = 1:nchars,
+    po          = unlist(str_split(unique(d$PO), "")),
+    seqCR       = unlist(str_split(unique(d$seqCR), ""))[1:nchars],
+    cons        = "x"
+  )
+  # fill the table with umis as variables, set all values in row to "x"
+  plotData[, unique(d$umiGroup)] <- "x"
+
+  # find all positions with mutations in umis
+  mutPos <-
+    sapply(
+      1:nrow(d),
+      function(i) {
+        pairwiseAlignmentPreset(
+          d$seqVDJ[i] %>%
+            # remove "N" (missing nt) from the sequence
+            # to exclude these from alignment
+            gsub(pattern = "N", replacement = ""),
+          unique(d$PO),
+          score = FALSE
+        )@pattern@mismatch@unlistData
+      }
+    ) %>%
+    unlist() %>%
+    unique() %>%
+    sort()
+
+  # replace x at all mutPos
+  for (i in mutPos) {
+    # copy letters from each umi at mutpos
+    plotData[i, d$umiGroup] <- as.list(substr(d$seqVDJ, i, i))
+  }
+  plotData[which(!plotData$pos %in% mutPos), c("po", "seqCR")] <- "x"
+
+  # create consensus based on the umis that underly the event
+  for (i in mutPos) {
+    plotData$cons[i] <- mode(unlist(sapply(
+      1:nrow(d),
+      function(r) {
+        rep(substr(d$seqVDJ[r], i, i), d$umiGroupCount[r])
+      }
+    )))
+  }
+
+  # make long
+  plotData <- plotData %>%
+    pivot_longer(
+      cols = colnames(plotData[5:ncol(plotData)]),
+      names_to = "umiGroup", values_to = "SHM"
+    ) %>%
+    # join in umi group count, size, start, end
+    left_join(
+      d %>% select(umiGroup, size, start, end),
+      by = "umiGroup"
+    )
+
+  # table for FR and CDR starts
+  frCdr <- d %>%
+    select(contains("IMGT")) %>%
+    slice_head(n = 1) %>%
+    t() %>%
+    as.data.frame() %>%
+    dplyr::rename(pos = V1) %>%
+    rownames_to_column(var = "name") %>%
+    filter(grepl("(start|end)$", name)) %>%
+    mutate(pos = as.integer(pos)) %>%
+    separate(name, into = c("reg", "place"), sep = " ") %>%
+    pivot_wider(id_cols = "reg", names_from = "place", values_from = "pos") %>%
+    mutate(reg = sub("-IMGT", "", reg))
+
+  # x-axis limits
+  xLimitsBreaksNumbers <- unique(c(
+    1, seq(from = 50, to = unique(nchar(d$seqVDJ)), by = 50),
+    nchar(unique(d$seqVDJ))
+  )) |>
+    # not within -3 to +3 letters from events AND the end
+    discard(
+      ~ .x %in% unique(c(
+        c(sapply(seq(-4, 4), function(x) {
+          eventPos - x
+        })),
+        nchar(unique(d$PO)) - c(1:4)
+      ))
+    ) |>
+    # add eventPos
+    base::append(eventPos) |>
+    sort.int()
+
+  xLimitsBreaksColors <- sapply(xLimitsBreaksNumbers, function(x) {
+    if (x %in% eventPos) "red" else "black"
+  })
+
+  seq_length <- max(nchar(d$seqVDJ %>% unique()))
+
+  p <-ggplot() +
+    ggtitle(paste0(
+      unique(d$subject), "  |  ", s, "  |  cell = ", c, "  |  ",
+      unique(d$ig), "  |  SHM caught in the act @ nt ", paste(eventPos, collapse = " ")
+    )) +
+    theme_light() +
+    # fixed colors for bases
+    scale_fill_manual(
+      values =
+        palette_nucleotides %>%
+          setNames(c("A", "C", "G", "T"))
+    ) +
+
+    # CDR
+    geom_rect(
+      data = frCdr %>%
+        filter(reg %like% "CDR"),
+      aes(xmin = start - 0.5, xmax = end + 0.5, ymin = 0, ymax = 1),
+      fill = color_cdr, alpha = 0.2
+    ) +
+    # custom breaks on x axis with event pos = red
+    scale_x_continuous(expand = c(0, 0), breaks = xLimitsBreaksNumbers) +
+    scale_y_continuous(expand = c(0, 0)) +
+    theme(axis.text.x = element_text(color = xLimitsBreaksColors)) +
+
+    # PO
+    # background
+    geom_rect(
+      data = plotData %>% distinct(pos, .keep_all = TRUE),
+      aes(xmin = pos - 0.4, xmax = pos + 0.4, ymin = -0.1, ymax = -0.01),
+      fill = "#dadada"
+    ) +
+    # letters that have changed
+    geom_rect(
+      data = plotData %>% filter(po != "x") %>% distinct(pos, .keep_all = TRUE),
+      aes(xmin = pos - 0.4, xmax = pos + 0.4, ymin = -0.1, ymax = -0.01, fill = po)
+    ) +
+    annotate("text", label = "primordial  ", x = 14 + seq_length, y = -0.05, hjust = 1) +
+    annotate("text", label = "wrCy motif  ", x = 14 + seq_length, y = -0.14, hjust = 1) +
+    annotate("text", label = "wA motif  ", x = 14 + seq_length, y = -0.22, hjust = 1) +
+    annotate("text", label = "rCg motif  ", x = 14 + seq_length, y = -0.295, hjust = 1) +
+
+    # umigroups, iterate, alpha 0.5 for all SHM
+    sapply(
+      unique(plotData$umiGroup),
+      function(umiGroup) {
+        PlotUmiGroup(plotData, umiGroup)
+      }
+    ) +
+
+    # bold lines at event position (s)
+    geom_rect(
+      data = plotData %>% filter(pos %in% eventPos),
+      aes(xmin = pos - 0.6, xmax = pos + 0.6, ymin = start, ymax = end, fill = SHM)
+    ) +
+
+    # AID motifs
+    mapply(function(motif, pos) {
+      plot_aid_motif(aid_motifs, motif, pos)
+    }, c("WRCY", "WA", "RCG"), c(-0.11, -0.19, -0.27)) +
+
+    # styling
+    guides(fill = guide_legend(title = "base")) +
+    xlab("position") +
+    ylab("UMIs") +
+    theme(
+      panel.grid = element_blank(),
+      panel.border = element_blank(),
+      axis.ticks = element_blank(),
+      axis.text = element_text(size = 16), # face = "bold" ),
+      axis.text.y = element_blank(),
+      axis.title.y = element_text(
+        size = 18, angle = 90, # face = "bold"
+        hjust = 0.6, margin = margin(r = 6)
+      ),
+      axis.title.x = element_text(size = 24), # face = "bold" ),
+      legend.key.width = unit(0.4, "cm"),
+      legend.key.height = unit(1, "cm"),
+      legend.text = element_text(size = 17),
+      legend.title = element_blank(),
+      plot.title = element_text(size = 17)
+    ) +
+
+    # hlines to separate umi groups
+    geom_segment(
+      data = d %>% filter(start != 0),
+      aes(y = start, yend = start),
+      x = 0, xend = seq_length,
+      linewidth = 0.25,
+      color = "#dadada",
+    ) +
+    # yaxis labels with umi group counts
+    geom_text(
+      data = d %>% mutate(labelPos = (start + end) / 2),
+      aes(x = -2, y = labelPos, label = umiGroupCount), size = 4, hjust = 0
+    )
+
+  ggsave(
+    str_interp("outs/shm_events_img/${unique(d$subject)}_${s}_${c}_${unique(d$ig)}.pdf"),
+    p,
+    width = 22,
+    height = 3.5
+  )
+
+  p
+})
+```

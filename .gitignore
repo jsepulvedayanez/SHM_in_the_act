@@ -6,3 +6,8 @@ renv/
 .dvc/cache/
 .dvc/tmp/
 .dvc/config.local
+cache/
+scdblfinder_nf/
+/archive
+/foldchanges.rds
+/event_plotting
